@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude flutter_secure_storage SharedPreferences — encrypted with
+         device-specific keystore keys that don't survive reinstall/migration. -->
+    <exclude domain="sharedpref" path="FlutterSecureStorage" />
+</full-backup-content>
