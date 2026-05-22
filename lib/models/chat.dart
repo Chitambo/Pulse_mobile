@@ -286,7 +286,7 @@ class NotificationPreference {
 
   bool get isActiveNow {
     if (!dndEnabled) return false;
-    final now = TimeOfDay.now();
+    final now = DateTime.now();
     final current = now.hour * 60 + now.minute;
     final start = _parse(dndStart);
     final end = _parse(dndEnd);

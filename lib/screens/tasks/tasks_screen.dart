@@ -212,7 +212,7 @@ class _TaskList extends StatelessWidget {
       onRefresh: () async {},
       child: ListView(
         padding: const EdgeInsets.symmetric(vertical: 8),
-        children: _TasksScreen._statusOrder.map((status) {
+        children: _TasksScreenState._statusOrder.map((status) {
           final items = grouped[status] ?? [];
           if (items.isEmpty) return const SizedBox.shrink();
           final isCollapsed = collapsed.contains(status);
@@ -527,7 +527,7 @@ class _StatusPicker extends StatelessWidget {
           children: [
             const Text('Change Status', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
             const SizedBox(height: 12),
-            ..._TasksScreen._statusOrder.map((s) => ListTile(
+            ..._TasksScreenState._statusOrder.map((s) => ListTile(
               contentPadding: EdgeInsets.zero,
               leading: _StatusDot(status: s),
               title: Text(ChatTask.statusLabels[s] ?? s),
