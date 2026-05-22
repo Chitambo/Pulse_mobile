@@ -139,19 +139,20 @@ class ChatChannel {
         description: j['description'],
         lastMessage: j['lastMessage'] != null ? ChatMessage.fromJson(j['lastMessage']) : null,
         unreadCount: j['unread'] ?? j['unreadCount'] ?? 0,
-        members: (j['members'] as List? ?? []).map((m) => ChatMember.fromJson(m)).toList(),
+        members: ((j['members'] ?? j['participants'] ?? j['users'] ?? []) as List)
+            .map((m) => ChatMember.fromJson(m as Map<String, dynamic>))
+            .toList(),
         notificationLevel: j['notificationLevel'] ?? 'all',
       );
 
   String displayName(int myUserId) {
     if (type == 'dm') {
-      final other = members.firstWhere(
-        (m) => m.id != myUserId,
-        orElse: () => members.isNotEmpty
-            ? members.first
-            : ChatMember(id: 0, username: name, isOnline: false),
-      );
-      return other.displayName;
+      if (members.isEmpty) return 'Direct Message';
+      try {
+        return members.firstWhere((m) => m.id != myUserId).displayName;
+      } catch (_) {
+        return members.first.displayName;
+      }
     }
     return name;
   }
