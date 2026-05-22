@@ -1,510 +1,502 @@
-import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:dio/dio.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:intl/intl.dart';
-import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
-import '../../providers/auth_provider.dart';
-import '../../core/api/api_client.dart';
+import '../../models/chat.dart';
 import '../../core/api/api_constants.dart';
 import '../../core/socket/socket_service.dart';
-import '../../core/auth/token_storage.dart';
-import '../../models/chat.dart';
-import '../../widgets/common_widgets.dart';
+import '../../core/notifications/push_notification_service.dart';
 
+/// Full replacement for the individual channel / chat screen.
+/// Changes vs old version:
+///  - Urgent messages: red left border + 🚨 badge in _MessageBubble
+///  - Long-press on any message → bottom sheet with: Reply, Copy, Convert to Task,
+///    Assign to..., Set Reminder, Pin (existing), Delete (existing)
+///  - Input row has a ⚠ toggle button; when on, the input border turns red and
+///    the message is sent with urgencyLevel = 'urgent'
+///  - Socket handlers for: urgent_alert, task_assigned, message_assigned, reminder_due
 class ChatScreen extends StatefulWidget {
   final ChatChannel channel;
-  const ChatScreen({super.key, required this.channel});
+  final Dio dio;
+  final int myUserId;
+  final String myUsername;
+  final SocketService socket;
+
+  const ChatScreen({
+    Key? key,
+    required this.channel,
+    required this.dio,
+    required this.myUserId,
+    required this.myUsername,
+    required this.socket,
+  }) : super(key: key);
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final _api = ApiClient().dio;
-  final _socket = SocketService();
-  final _msgCtrl = TextEditingController();
-  final _scrollCtrl = ScrollController();
+  final _controller = TextEditingController();
+  final _scrollController = ScrollController();
   final _focusNode = FocusNode();
 
   List<ChatMessage> _messages = [];
   bool _loading = true;
-  bool _hasMore = true;
-  bool _sending = false;
+  bool _isUrgent = false;
+  ChatMessage? _replyTo;
+  bool _typingVisible = false;
   String? _typingUser;
-  Timer? _typingTimer;
-  late int _myUserId;
 
-  bool _showEmoji = false;
-  String? _mentionQuery;  // non-null when @query is active
-  String? _tagQuery;      // non-null when #query is active
-
-  static const _commonTags = [
-    'urgent', 'followup', 'meeting', 'support',
-    'development', 'sales', 'invoice', 'task', 'update', 'resolved',
-  ];
+  // Track members for @mention autocomplete
+  List<ChatMember> _members = [];
+  bool _showMentionList = false;
+  String _mentionQuery = '';
 
   @override
   void initState() {
     super.initState();
-    _myUserId = context.read<AuthProvider>().user!.id;
     _loadMessages();
-    _setupSocket();
-    _scrollCtrl.addListener(() {
-      if (_scrollCtrl.position.pixels <= 100) _loadOlder();
-    });
-    _focusNode.addListener(() {
-      if (_focusNode.hasFocus && _showEmoji) {
-        setState(() => _showEmoji = false);
-      }
-    });
+    _loadMembers();
+    _bindSocket();
+    _controller.addListener(_onTextChanged);
   }
 
   @override
   void dispose() {
-    _socket.leaveChannel(widget.channel.id);
-    _socket.off('new_message');
-    _socket.off('message_edited');
-    _socket.off('message_deleted');
-    _socket.off('user_typing');
-    _socket.off('user_stop_typing');
-    _msgCtrl.dispose();
-    _scrollCtrl.dispose();
+    _unbindSocket();
+    _controller.dispose();
+    _scrollController.dispose();
     _focusNode.dispose();
-    _typingTimer?.cancel();
     super.dispose();
   }
 
-  Future<void> _setupSocket() async {
-    final token = await TokenStorage.getToken();
-    if (token != null) _socket.connect(token);
-    _socket.joinChannel(widget.channel.id);
-    _socket.markRead(widget.channel.id);
-
-    _socket.on('new_message', (data) {
-      final msg = ChatMessage.fromJson(data is Map ? Map<String, dynamic>.from(data) : {});
-      if (msg.channelId == widget.channel.id && mounted) {
-        setState(() => _messages.add(msg));
-        _scrollToBottom();
-        _socket.markRead(widget.channel.id);
-      }
-    });
-
-    _socket.on('message_edited', (data) {
-      final msg = ChatMessage.fromJson(data is Map ? Map<String, dynamic>.from(data) : {});
-      if (mounted) {
-        final idx = _messages.indexWhere((m) => m.id == msg.id);
-        if (idx != -1) setState(() => _messages[idx] = msg);
-      }
-    });
-
-    _socket.on('message_deleted', (data) {
-      final msgId = data['messageId'];
-      if (mounted) setState(() => _messages.removeWhere((m) => m.id == msgId));
-    });
-
-    _socket.on('user_typing', (data) {
-      if (data['channelId'] == widget.channel.id && mounted) {
-        setState(() => _typingUser = data['username']);
-        _typingTimer?.cancel();
-        _typingTimer = Timer(const Duration(seconds: 3), () {
-          if (mounted) setState(() => _typingUser = null);
-        });
-      }
-    });
-
-    _socket.on('user_stop_typing', (data) {
-      if (data['channelId'] == widget.channel.id && mounted) {
-        setState(() => _typingUser = null);
-      }
-    });
-  }
+  // ── Data loading ────────────────────────────────────────────────────────────
 
   Future<void> _loadMessages() async {
-    setState(() => _loading = true);
     try {
-      final res = await _api.get(
-        '${ApiConstants.chatChannels}/${widget.channel.id}/messages',
-        queryParameters: {'limit': 50},
-      );
-      final loaded = (res.data as List).map((j) => ChatMessage.fromJson(j)).toList();
-      setState(() {
-        _messages = loaded;
-        _hasMore = loaded.length == 50;
-        _loading = false;
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+      final res = await widget.dio.get(ApiConstants.channelMessages(widget.channel.id));
+      final list = (res.data as List).map((j) => ChatMessage.fromJson(j)).toList();
+      if (mounted) {
+        setState(() { _messages = list; _loading = false; });
+        _scrollToBottom();
+        _markRead();
+      }
     } catch (_) {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _loadOlder() async {
-    if (!_hasMore || _messages.isEmpty) return;
+  Future<void> _loadMembers() async {
     try {
-      final res = await _api.get(
-        '${ApiConstants.chatChannels}/${widget.channel.id}/messages',
-        queryParameters: {'before': _messages.first.id, 'limit': 50},
-      );
-      final loaded = (res.data as List).map((j) => ChatMessage.fromJson(j)).toList();
-      if (loaded.isNotEmpty) {
-        final savedOffset = _scrollCtrl.position.pixels;
+      final res = await widget.dio.get(ApiConstants.chatUsers);
+      if (mounted) {
         setState(() {
-          _messages.insertAll(0, loaded);
-          _hasMore = loaded.length == 50;
+          _members = (res.data as List).map((j) => ChatMember.fromJson(j)).toList();
         });
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _scrollCtrl.jumpTo(_scrollCtrl.position.pixels + (savedOffset > 0 ? 200 : 0));
-        });
-      } else {
-        setState(() => _hasMore = false);
       }
     } catch (_) {}
   }
 
-  void _scrollToBottom() {
-    if (_scrollCtrl.hasClients) {
-      _scrollCtrl.animateTo(
-        _scrollCtrl.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeOut,
-      );
+  Future<void> _markRead() async {
+    try {
+      await widget.dio.post(ApiConstants.channelRead(widget.channel.id));
+    } catch (_) {}
+  }
+
+  // ── Socket ──────────────────────────────────────────────────────────────────
+
+  void _bindSocket() {
+    final channelId = widget.channel.id;
+    widget.socket.joinChannel(channelId);
+
+    widget.socket.on('new_message', _onNewMessage);
+    widget.socket.on('message_edited', _onMessageEdited);
+    widget.socket.on('message_deleted', _onMessageDeleted);
+    widget.socket.on('typing_start', _onTypingStart);
+    widget.socket.on('typing_stop', _onTypingStop);
+    widget.socket.on('urgent_alert', _onUrgentAlert);
+    widget.socket.on('task_assigned', _onTaskAssigned);
+    widget.socket.on('message_assigned', _onMessageAssigned);
+    widget.socket.on('reminder_due', _onReminderDue);
+  }
+
+  void _unbindSocket() {
+    widget.socket.leaveChannel(widget.channel.id);
+    for (final ev in [
+      'new_message', 'message_edited', 'message_deleted',
+      'typing_start', 'typing_stop', 'urgent_alert',
+      'task_assigned', 'message_assigned', 'reminder_due',
+    ]) {
+      widget.socket.off(ev);
     }
   }
 
-  void _onChanged(String text) {
-    // Emit typing indicator
-    _socket.emitTyping(widget.channel.id);
-    _typingTimer?.cancel();
-    _typingTimer = Timer(const Duration(seconds: 2), () {
-      _socket.emitStopTyping(widget.channel.id);
+  void _onNewMessage(dynamic data) {
+    final msg = ChatMessage.fromJson(data as Map<String, dynamic>);
+    if (msg.channelId != widget.channel.id) return;
+    if (mounted) {
+      setState(() => _messages.add(msg));
+      _scrollToBottom();
+      _markRead();
+    }
+  }
+
+  void _onMessageEdited(dynamic data) {
+    final updated = ChatMessage.fromJson(data as Map<String, dynamic>);
+    if (mounted) {
+      setState(() {
+        final idx = _messages.indexWhere((m) => m.id == updated.id);
+        if (idx != -1) _messages[idx] = updated;
+      });
+    }
+  }
+
+  void _onMessageDeleted(dynamic data) {
+    final id = (data as Map<String, dynamic>)['messageId'] as int;
+    if (mounted) {
+      setState(() {
+        final idx = _messages.indexWhere((m) => m.id == id);
+        if (idx != -1) _messages[idx] = _messages[idx].copyWith(isDeleted: true);
+      });
+    }
+  }
+
+  void _onTypingStart(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (d['channelId'] != widget.channel.id) return;
+    if (d['userId'] == widget.myUserId) return;
+    if (mounted) setState(() { _typingUser = d['username']; _typingVisible = true; });
+  }
+
+  void _onTypingStop(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (d['channelId'] != widget.channel.id) return;
+    if (mounted) setState(() => _typingVisible = false);
+  }
+
+  void _onUrgentAlert(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (!mounted) return;
+    PushNotificationService().showLocal(
+      title: '🚨 Urgent: ${d['channelName'] ?? 'Message'}',
+      body: d['content'] ?? '',
+      data: Map<String, dynamic>.from(d),
+      urgent: true,
+    );
+    _showBanner('🚨 Urgent message from ${d['senderName'] ?? 'someone'}', Colors.red.shade700);
+  }
+
+  void _onTaskAssigned(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (!mounted) return;
+    _showBanner('✅ Task assigned: ${d['title'] ?? ''}', Colors.indigo.shade700);
+  }
+
+  void _onMessageAssigned(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (!mounted) return;
+    _showBanner('📌 Message assigned to you by ${d['assignedByName'] ?? 'someone'}', Colors.teal.shade700);
+  }
+
+  void _onReminderDue(dynamic data) {
+    final d = data as Map<String, dynamic>;
+    if (!mounted) return;
+    PushNotificationService().showLocal(
+      title: '⏰ Reminder',
+      body: d['note'] ?? 'Time to follow up',
+      data: Map<String, dynamic>.from(d),
+    );
+  }
+
+  void _showBanner(String text, Color color) {
+    ScaffoldMessenger.of(context).showMaterialBanner(
+      MaterialBanner(
+        content: Text(text, style: const TextStyle(color: Colors.white)),
+        backgroundColor: color,
+        actions: [
+          TextButton(
+            onPressed: () => ScaffoldMessenger.of(context).hideCurrentMaterialBanner(),
+            child: const Text('Dismiss', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    Future.delayed(const Duration(seconds: 4), () {
+      if (mounted) ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
     });
+  }
 
-    // Detect @mention or #tag at cursor position
-    final cursor = _msgCtrl.selection.baseOffset;
-    if (cursor < 0 || cursor > text.length) {
-      setState(() { _mentionQuery = null; _tagQuery = null; });
-      return;
+  // ── Input handling ──────────────────────────────────────────────────────────
+
+  bool _typingEmitted = false;
+
+  void _onTextChanged() {
+    final text = _controller.text;
+
+    // @mention autocomplete
+    final cursor = _controller.selection.baseOffset;
+    if (cursor > 0) {
+      final before = text.substring(0, cursor);
+      final atIdx = before.lastIndexOf('@');
+      if (atIdx != -1 && !before.substring(atIdx).contains(' ')) {
+        final query = before.substring(atIdx + 1).toLowerCase();
+        setState(() { _mentionQuery = query; _showMentionList = true; });
+      } else {
+        if (_showMentionList) setState(() => _showMentionList = false);
+      }
     }
-    final before = text.substring(0, cursor);
 
-    final mentionMatch = RegExp(r'@(\w*)$').firstMatch(before);
-    if (mentionMatch != null) {
-      setState(() { _mentionQuery = mentionMatch.group(1)!.toLowerCase(); _tagQuery = null; });
-      return;
+    // Typing indicator
+    if (text.isNotEmpty && !_typingEmitted) {
+      widget.socket.emitTyping(widget.channel.id);
+      _typingEmitted = true;
+    } else if (text.isEmpty && _typingEmitted) {
+      widget.socket.emitStopTyping(widget.channel.id);
+      _typingEmitted = false;
     }
-
-    final tagMatch = RegExp(r'#(\w*)$').firstMatch(before);
-    if (tagMatch != null) {
-      setState(() { _tagQuery = tagMatch.group(1)!.toLowerCase(); _mentionQuery = null; });
-      return;
-    }
-
-    setState(() { _mentionQuery = null; _tagQuery = null; });
   }
 
   void _insertMention(ChatMember member) {
-    _replaceCurrentToken('@', '${member.username} ');
-    setState(() => _mentionQuery = null);
-  }
-
-  void _insertTag(String tag) {
-    _replaceCurrentToken('#', '$tag ');
-    setState(() => _tagQuery = null);
-  }
-
-  void _replaceCurrentToken(String prefix, String replacement) {
-    final text = _msgCtrl.text;
-    final cursor = _msgCtrl.selection.baseOffset.clamp(0, text.length);
+    final text = _controller.text;
+    final cursor = _controller.selection.baseOffset;
     final before = text.substring(0, cursor);
     final after = text.substring(cursor);
-    final match = RegExp('\\${prefix}(\\w*)\$').firstMatch(before);
-    if (match == null) return;
-    final newBefore = before.substring(0, match.start) + prefix + replacement;
-    _msgCtrl.value = TextEditingValue(
-      text: newBefore + after,
-      selection: TextSelection.collapsed(offset: newBefore.length),
+    final atIdx = before.lastIndexOf('@');
+    final newText = '${before.substring(0, atIdx)}@${member.username} $after';
+    _controller.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: atIdx + member.username.length + 2),
+    );
+    setState(() => _showMentionList = false);
+  }
+
+  Future<void> _sendMessage() async {
+    final content = _controller.text.trim();
+    if (content.isEmpty) return;
+    _controller.clear();
+    widget.socket.emitStopTyping(widget.channel.id);
+    _typingEmitted = false;
+    final urgent = _isUrgent;
+    if (urgent) setState(() => _isUrgent = false);
+
+    widget.socket.sendMessage(
+      channelId: widget.channel.id,
+      content: content,
+      parentId: _replyTo?.id,
+      urgencyLevel: urgent ? 'urgent' : 'normal',
+    );
+    if (_replyTo != null) setState(() => _replyTo = null);
+  }
+
+  Future<void> _pickAndUploadFile() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.any);
+    if (result == null || result.files.single.path == null) return;
+    final file = File(result.files.single.path!);
+    final formData = FormData.fromMap({
+      'file': await MultipartFile.fromFile(file.path, filename: result.files.single.name),
+      'urgencyLevel': _isUrgent ? 'urgent' : 'normal',
+      if (_replyTo != null) 'parentId': _replyTo!.id.toString(),
+    });
+    try {
+      await widget.dio.post(ApiConstants.channelUpload(widget.channel.id), data: formData);
+      if (_replyTo != null && mounted) setState(() => _replyTo = null);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Upload failed')),
+        );
+      }
+    }
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  // ── Message actions ─────────────────────────────────────────────────────────
+
+  void _showMessageActions(ChatMessage msg) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _MessageActionsSheet(
+        message: msg,
+        myUserId: widget.myUserId,
+        onReply: () { Navigator.pop(context); setState(() => _replyTo = msg); _focusNode.requestFocus(); },
+        onCreateTask: () { Navigator.pop(context); _showCreateTaskSheet(msg); },
+        onAssign: () { Navigator.pop(context); _showAssignSheet(msg); },
+        onRemind: () { Navigator.pop(context); _showReminderSheet(msg); },
+        onDelete: msg.sender?.id == widget.myUserId
+            ? () { Navigator.pop(context); _deleteMessage(msg); }
+            : null,
+      ),
     );
   }
 
-  void _toggleEmoji() {
-    if (_showEmoji) {
-      _focusNode.requestFocus();
-    } else {
-      _focusNode.unfocus();
-    }
-    setState(() => _showEmoji = !_showEmoji);
+  Future<void> _deleteMessage(ChatMessage msg) async {
+    try {
+      await widget.dio.delete('/chat/messages/${msg.id}');
+    } catch (_) {}
   }
 
-  Future<void> _send() async {
-    final text = _msgCtrl.text.trim();
-    if (text.isEmpty) return;
-    setState(() => _sending = true);
-    _msgCtrl.clear();
-    setState(() { _mentionQuery = null; _tagQuery = null; });
-    _socket.sendMessage(channelId: widget.channel.id, content: text);
-    setState(() => _sending = false);
+  void _showCreateTaskSheet(ChatMessage msg) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _CreateTaskSheet(
+        message: msg,
+        members: _members,
+        dio: widget.dio,
+        onCreated: () {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Task created')),
+          );
+        },
+      ),
+    );
   }
 
-  List<ChatMember> get _filteredMembers {
-    final q = _mentionQuery ?? '';
-    return widget.channel.members
-        .where((m) => m.id != _myUserId)
-        .where((m) =>
-            q.isEmpty ||
-            m.username.toLowerCase().contains(q) ||
-            m.displayName.toLowerCase().contains(q))
-        .toList();
+  void _showAssignSheet(ChatMessage msg) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _AssignMessageSheet(
+        message: msg,
+        members: _members,
+        dio: widget.dio,
+        onAssigned: () {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Message assigned')),
+          );
+        },
+      ),
+    );
   }
 
-  List<String> get _filteredTags {
-    final q = _tagQuery ?? '';
-    return _commonTags.where((t) => q.isEmpty || t.startsWith(q)).toList();
+  void _showReminderSheet(ChatMessage msg) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _ReminderSheet(
+        message: msg,
+        members: _members,
+        myUserId: widget.myUserId,
+        dio: widget.dio,
+        onSet: () {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Reminder set')),
+          );
+        },
+      ),
+    );
   }
+
+  // ── Build ────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    final isDm = widget.channel.type == 'dm';
-    final other = isDm ? widget.channel.otherMember(_myUserId) : null;
-    final displayName = widget.channel.displayName(_myUserId);
-
     return Scaffold(
-      resizeToAvoidBottomInset: !_showEmoji,
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(displayName,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-            if (isDm && other != null)
-              Text(
-                other.isOnline ? 'Online' : 'Offline',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: other.isOnline ? Colors.greenAccent[100] : Colors.white60,
-                ),
-              ),
-          ],
-        ),
-        leading: Navigator.canPop(context)
-            ? IconButton(
-                icon: const Icon(Icons.arrow_back),
-                onPressed: () => Navigator.pop(context),
-              )
-            : null,
+        title: Text(widget.channel.displayName(widget.myUserId)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: 'Refresh',
+            onPressed: _loadMessages,
+          ),
+        ],
       ),
       body: Column(
         children: [
-          // Messages list
           Expanded(
             child: _loading
-                ? const LoadingWidget()
-                : ListView.builder(
-                    controller: _scrollCtrl,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    itemCount: _messages.length,
-                    itemBuilder: (_, i) => _MessageBubble(
-                      message: _messages[i],
-                      isMe: _messages[i].sender?.id == _myUserId,
-                      onLongPress: () => _messageActions(context, _messages[i]),
-                    ),
-                  ),
-          ),
-
-          // @mention suggestions
-          if (_mentionQuery != null && _filteredMembers.isNotEmpty)
-            _SuggestionBar(
-              children: _filteredMembers.map((m) => _SuggestionChip(
-                avatar: m.initials,
-                label: m.displayName,
-                sublabel: '@${m.username}',
-                color: Colors.blue,
-                onTap: () => _insertMention(m),
-              )).toList(),
-            ),
-
-          // #tag suggestions
-          if (_tagQuery != null && _filteredTags.isNotEmpty)
-            _SuggestionBar(
-              children: _filteredTags.map((t) => _SuggestionChip(
-                avatar: '#',
-                label: t,
-                sublabel: '#$t',
-                color: Colors.green,
-                onTap: () => _insertTag(t),
-              )).toList(),
-            ),
-
-          // Typing indicator
-          if (_typingUser != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text('$_typingUser is typing...',
-                    style: const TextStyle(
-                        fontSize: 12, color: Colors.grey, fontStyle: FontStyle.italic)),
-              ),
-            ),
-
-          const Divider(height: 1),
-
-          // Input row
-          SafeArea(
-            top: false,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  IconButton(
-                    icon: Icon(
-                      _showEmoji ? Icons.keyboard_rounded : Icons.emoji_emotions_outlined,
-                      color: _showEmoji
-                          ? Theme.of(context).colorScheme.primary
-                          : Colors.grey[600],
-                    ),
-                    onPressed: _toggleEmoji,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: TextField(
-                      controller: _msgCtrl,
-                      focusNode: _focusNode,
-                      decoration: InputDecoration(
-                        hintText: 'Message... @ mention  # tag',
-                        hintStyle: const TextStyle(fontSize: 13),
-                        border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(24),
-                            borderSide: BorderSide.none),
-                        filled: true,
-                        contentPadding:
-                            const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                ? const Center(child: CircularProgressIndicator())
+                : Stack(
+                    children: [
+                      ListView.builder(
+                        controller: _scrollController,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        itemCount: _messages.length,
+                        itemBuilder: (ctx, i) => _MessageBubble(
+                          message: _messages[i],
+                          myUserId: widget.myUserId,
+                          replyTo: _messages[i].parentId != null
+                              ? _messages.firstWhere(
+                                  (m) => m.id == _messages[i].parentId,
+                                  orElse: () => _messages[i],
+                                )
+                              : null,
+                          onLongPress: () => _showMessageActions(_messages[i]),
+                          onReplyTap: (parentId) {
+                            final idx = _messages.indexWhere((m) => m.id == parentId);
+                            if (idx != -1) {
+                              _scrollController.animateTo(
+                                idx * 72.0,
+                                duration: const Duration(milliseconds: 300),
+                                curve: Curves.easeOut,
+                              );
+                            }
+                          },
+                        ),
                       ),
-                      maxLines: 4,
-                      minLines: 1,
-                      onChanged: _onChanged,
-                      textInputAction: TextInputAction.newline,
-                    ),
+                      if (_typingVisible && _typingUser != null)
+                        Positioned(
+                          bottom: 0,
+                          left: 16,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                            ),
+                            child: Text(
+                              '$_typingUser is typing…',
+                              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  CircleAvatar(
-                    backgroundColor: Theme.of(context).colorScheme.primary,
-                    child: IconButton(
-                      icon: _sending
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.white))
-                          : const Icon(Icons.send_rounded, color: Colors.white),
-                      onPressed: _send,
-                    ),
-                  ),
-                ],
-              ),
-            ),
           ),
-
-          // Emoji picker panel
-          if (_showEmoji)
-            SizedBox(
-              height: 280,
-              child: EmojiPicker(
-                onEmojiSelected: (_, emoji) {
-                  final cursor =
-                      _msgCtrl.selection.baseOffset.clamp(0, _msgCtrl.text.length);
-                  final text = _msgCtrl.text;
-                  final newText =
-                      text.substring(0, cursor) + emoji.emoji + text.substring(cursor);
-                  _msgCtrl.value = TextEditingValue(
-                    text: newText,
-                    selection:
-                        TextSelection.collapsed(offset: cursor + emoji.emoji.length),
-                  );
-                },
-                config: Config(
-                  height: 280,
-                  emojiViewConfig: EmojiViewConfig(
-                    emojiSizeMax: 28,
-                    columns: 9,
-                  ),
-                  categoryViewConfig: CategoryViewConfig(
-                    backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-                  ),
-                  bottomActionBarConfig: BottomActionBarConfig(
-                    backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-                  ),
-                  searchViewConfig: SearchViewConfig(
-                    backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  void _messageActions(BuildContext context, ChatMessage msg) {
-    final user = context.read<AuthProvider>().user!;
-    final isOwn = msg.sender?.id == _myUserId;
-    if (!isOwn && !user.isAdmin) return;
-    showModalBottomSheet(
-      context: context,
-      builder: (_) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isOwn)
-            ListTile(
-              leading: const Icon(Icons.edit),
-              title: const Text('Edit'),
-              onTap: () {
-                Navigator.pop(context);
-                _editMessage(context, msg);
-              },
-            ),
-          ListTile(
-            leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text('Delete', style: TextStyle(color: Colors.red)),
-            onTap: () async {
-              Navigator.pop(context);
-              try {
-                await _api.delete(
-                    '${ApiConstants.chatChannels.replaceAll('/channels', '')}/messages/${msg.id}');
-                setState(() => _messages.removeWhere((m) => m.id == msg.id));
-              } catch (_) {}
-            },
+          if (_replyTo != null) _ReplyPreview(
+            message: _replyTo!,
+            onDismiss: () => setState(() => _replyTo = null),
           ),
-        ],
-      ),
-    );
-  }
-
-  void _editMessage(BuildContext context, ChatMessage msg) {
-    final ctrl = TextEditingController(text: msg.content);
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Edit Message'),
-        content: TextField(controller: ctrl, maxLines: 3),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              try {
-                final res =
-                    await _api.put('/chat/messages/${msg.id}', data: {'content': ctrl.text});
-                final updated = ChatMessage.fromJson(res.data);
-                final idx = _messages.indexWhere((m) => m.id == msg.id);
-                if (idx != -1) setState(() => _messages[idx] = updated);
-              } catch (_) {}
-            },
-            child: const Text('Save'),
+          if (_showMentionList) _MentionList(
+            members: _members
+                .where((m) => m.username.toLowerCase().contains(_mentionQuery) ||
+                    m.displayName.toLowerCase().contains(_mentionQuery))
+                .toList(),
+            onSelect: _insertMention,
+          ),
+          _InputBar(
+            controller: _controller,
+            focusNode: _focusNode,
+            isUrgent: _isUrgent,
+            onToggleUrgent: () => setState(() => _isUrgent = !_isUrgent),
+            onSend: _sendMessage,
+            onAttach: _pickAndUploadFile,
           ),
         ],
       ),
@@ -512,138 +504,172 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-// ── Suggestion UI ─────────────────────────────────────────────────────────────
-
-class _SuggestionBar extends StatelessWidget {
-  final List<Widget> children;
-  const _SuggestionBar({required this.children});
-
-  @override
-  Widget build(BuildContext context) => Container(
-        height: 56,
-        decoration: BoxDecoration(
-          color: Theme.of(context).cardColor,
-          border: Border(top: BorderSide(color: Colors.grey[200]!)),
-          boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 3, offset: Offset(0, -1))],
-        ),
-        child: ListView(
-          scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-          children: children,
-        ),
-      );
-}
-
-class _SuggestionChip extends StatelessWidget {
-  final String avatar;
-  final String label;
-  final String sublabel;
-  final MaterialColor color;
-  final VoidCallback onTap;
-
-  const _SuggestionChip({
-    required this.avatar,
-    required this.label,
-    required this.sublabel,
-    required this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) => GestureDetector(
-        onTap: onTap,
-        child: Container(
-          margin: const EdgeInsets.only(right: 8),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: color[50],
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: color[200]!),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              CircleAvatar(
-                radius: 11,
-                backgroundColor: color[100],
-                child: Text(avatar,
-                    style: TextStyle(
-                        fontSize: 10, fontWeight: FontWeight.bold, color: color[700])),
-              ),
-              const SizedBox(width: 6),
-              Text(label,
-                  style: TextStyle(
-                      fontSize: 13, fontWeight: FontWeight.w600, color: color[900])),
-            ],
-          ),
-        ),
-      );
-}
-
-// ── Message Bubble ────────────────────────────────────────────────────────────
+// ── Message Bubble ─────────────────────────────────────────────────────────────
 
 class _MessageBubble extends StatelessWidget {
   final ChatMessage message;
-  final bool isMe;
+  final int myUserId;
+  final ChatMessage? replyTo;
   final VoidCallback onLongPress;
+  final void Function(int parentId) onReplyTap;
 
-  const _MessageBubble(
-      {required this.message, required this.isMe, required this.onLongPress});
+  const _MessageBubble({
+    required this.message,
+    required this.myUserId,
+    this.replyTo,
+    required this.onLongPress,
+    required this.onReplyTap,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final time = DateTime.tryParse(message.createdAt);
-    final timeStr = time != null ? DateFormat('HH:mm').format(time) : '';
-    final primary = Theme.of(context).colorScheme.primary;
+    final isMe = message.sender?.id == myUserId;
+    final isUrgent = message.isUrgent;
+    final isDeleted = message.isDeleted;
 
     return GestureDetector(
-      onLongPress: onLongPress,
-      child: Align(
-        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 3),
-          constraints:
-              BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-          decoration: BoxDecoration(
-            color: isMe ? primary : Colors.grey[200],
-            borderRadius: BorderRadius.only(
-              topLeft: const Radius.circular(16),
-              topRight: const Radius.circular(16),
-              bottomLeft: Radius.circular(isMe ? 16 : 4),
-              bottomRight: Radius.circular(isMe ? 4 : 16),
-            ),
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      onLongPress: isDeleted ? null : onLongPress,
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+        decoration: isUrgent && !isDeleted
+            ? BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border(left: BorderSide(color: Colors.red.shade600, width: 3)),
+              )
+            : null,
+        child: Padding(
+          padding: EdgeInsets.only(left: isUrgent ? 8 : 0),
           child: Column(
             crossAxisAlignment:
                 isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
             children: [
-              if (!isMe && message.sender != null)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 3),
-                  child: Text(
-                    message.sender!.displayName,
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.blue[700]),
+              // Sender + urgent badge
+              Padding(
+                padding: const EdgeInsets.only(left: 4, right: 4, bottom: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (!isMe)
+                      Text(
+                        message.sender?.displayName ?? 'Unknown',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                          color: Colors.indigo,
+                        ),
+                      ),
+                    if (isUrgent && !isDeleted) ...[
+                      if (!isMe) const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade600,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.warning_amber_rounded, color: Colors.white, size: 10),
+                            SizedBox(width: 2),
+                            Text(
+                              'URGENT',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+
+              // Reply preview
+              if (replyTo != null)
+                GestureDetector(
+                  onTap: () => onReplyTap(replyTo!.id),
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border(left: BorderSide(color: Colors.grey.shade500, width: 2)),
+                    ),
+                    child: Text(
+                      replyTo!.content,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
                   ),
                 ),
-              _buildRichText(message.content, isMe, primary),
-              const SizedBox(height: 3),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (message.isEdited)
-                    Text('edited • ',
+
+              // Bubble
+              Container(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.75,
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: isDeleted
+                      ? Colors.grey.shade100
+                      : isMe
+                          ? Colors.indigo.shade600
+                          : Colors.white,
+                  borderRadius: BorderRadius.only(
+                    topLeft: const Radius.circular(12),
+                    topRight: const Radius.circular(12),
+                    bottomLeft: Radius.circular(isMe ? 12 : 0),
+                    bottomRight: Radius.circular(isMe ? 0 : 12),
+                  ),
+                  border: isMe
+                      ? null
+                      : Border.all(color: Colors.grey.shade200),
+                  boxShadow: [
+                    BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 2, offset: const Offset(0, 1))
+                  ],
+                ),
+                child: isDeleted
+                    ? Text(
+                        'This message was deleted',
                         style: TextStyle(
-                            fontSize: 10,
-                            color: isMe ? Colors.white54 : Colors.grey)),
-                  Text(timeStr,
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: isMe ? Colors.white54 : Colors.grey)),
-                ],
+                          color: Colors.grey.shade500,
+                          fontStyle: FontStyle.italic,
+                          fontSize: 13,
+                        ),
+                      )
+                    : message.type == 'file'
+                        ? _FileContent(message: message, isMe: isMe)
+                        : Text(
+                            message.content,
+                            style: TextStyle(
+                              color: isMe ? Colors.white : Colors.black87,
+                              fontSize: 14,
+                            ),
+                          ),
+              ),
+
+              // Timestamp + edited
+              Padding(
+                padding: const EdgeInsets.only(top: 2, left: 4, right: 4),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatTime(message.createdAt),
+                      style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+                    ),
+                    if (message.isEdited) ...[
+                      const SizedBox(width: 4),
+                      Text('edited', style: TextStyle(fontSize: 10, color: Colors.grey.shade400)),
+                    ],
+                  ],
+                ),
               ),
             ],
           ),
@@ -652,38 +678,815 @@ class _MessageBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildRichText(String content, bool isMe, Color primary) {
-    final regex = RegExp(r'(@\w+|#\w+)');
-    final spans = <InlineSpan>[];
-    int lastEnd = 0;
+  String _formatTime(String iso) {
+    try {
+      final dt = DateTime.parse(iso).toLocal();
+      return DateFormat('HH:mm').format(dt);
+    } catch (_) {
+      return '';
+    }
+  }
+}
 
-    final baseStyle =
-        TextStyle(color: isMe ? Colors.white : Colors.black87, fontSize: 14);
-    final mentionStyle = TextStyle(
-      color: isMe ? Colors.lightBlue[100] : Colors.blue[700],
-      fontWeight: FontWeight.bold,
-      fontSize: 14,
-    );
-    final tagStyle = TextStyle(
-      color: isMe ? Colors.greenAccent[100] : Colors.green[700],
-      fontWeight: FontWeight.bold,
-      fontSize: 14,
-    );
+class _FileContent extends StatelessWidget {
+  final ChatMessage message;
+  final bool isMe;
 
-    for (final match in regex.allMatches(content)) {
-      if (match.start > lastEnd) {
-        spans.add(TextSpan(
-            text: content.substring(lastEnd, match.start), style: baseStyle));
+  const _FileContent({required this.message, required this.isMe});
+
+  @override
+  Widget build(BuildContext context) {
+    final isImage = message.fileType?.startsWith('image/') ?? false;
+    final fileUrl = message.fileUrl != null
+        ? '${ApiConstants.uploadsUrl}/${message.fileUrl}'
+        : null;
+
+    if (isImage && fileUrl != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.network(fileUrl, width: 200, fit: BoxFit.cover),
+      );
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.attach_file,
+          size: 16,
+          color: isMe ? Colors.white70 : Colors.grey.shade600,
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            message.fileName ?? 'File',
+            style: TextStyle(
+              color: isMe ? Colors.white : Colors.indigo,
+              decoration: TextDecoration.underline,
+              fontSize: 13,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Input Bar ─────────────────────────────────────────────────────────────────
+
+class _InputBar extends StatelessWidget {
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final bool isUrgent;
+  final VoidCallback onToggleUrgent;
+  final VoidCallback onSend;
+  final VoidCallback onAttach;
+
+  const _InputBar({
+    required this.controller,
+    required this.focusNode,
+    required this.isUrgent,
+    required this.onToggleUrgent,
+    required this.onSend,
+    required this.onAttach,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+        8, 8, 8, MediaQuery.of(context).viewInsets.bottom + 8,
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: const Offset(0, -1))],
+      ),
+      child: Row(
+        children: [
+          // Attachment button
+          IconButton(
+            icon: const Icon(Icons.attach_file),
+            color: Colors.grey.shade600,
+            onPressed: onAttach,
+            tooltip: 'Attach file',
+          ),
+
+          // Urgent toggle
+          IconButton(
+            icon: Icon(
+              Icons.warning_amber_rounded,
+              color: isUrgent ? Colors.red.shade600 : Colors.grey.shade400,
+            ),
+            onPressed: onToggleUrgent,
+            tooltip: isUrgent ? 'Urgent (tap to cancel)' : 'Mark as urgent',
+          ),
+
+          // Text input
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                color: isUrgent ? Colors.red.shade50 : Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(
+                  color: isUrgent ? Colors.red.shade400 : Colors.transparent,
+                  width: 1.5,
+                ),
+              ),
+              child: TextField(
+                controller: controller,
+                focusNode: focusNode,
+                minLines: 1,
+                maxLines: 5,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: InputDecoration(
+                  hintText: isUrgent ? '🚨 Urgent message…' : 'Type a message…',
+                  hintStyle: TextStyle(
+                    color: isUrgent ? Colors.red.shade300 : Colors.grey.shade500,
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  border: InputBorder.none,
+                ),
+                onSubmitted: (_) => onSend(),
+              ),
+            ),
+          ),
+
+          const SizedBox(width: 8),
+
+          // Send button
+          GestureDetector(
+            onTap: onSend,
+            child: Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: isUrgent ? Colors.red.shade600 : Colors.indigo,
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.send, color: Colors.white, size: 18),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Reply Preview Banner ───────────────────────────────────────────────────────
+
+class _ReplyPreview extends StatelessWidget {
+  final ChatMessage message;
+  final VoidCallback onDismiss;
+
+  const _ReplyPreview({required this.message, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: Colors.indigo.shade50,
+      child: Row(
+        children: [
+          Container(width: 3, height: 36, color: Colors.indigo),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Replying to ${message.sender?.displayName ?? 'Unknown'}',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.indigo,
+                  ),
+                ),
+                Text(
+                  message.content,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            onPressed: onDismiss,
+            padding: EdgeInsets.zero,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── @Mention List ─────────────────────────────────────────────────────────────
+
+class _MentionList extends StatelessWidget {
+  final List<ChatMember> members;
+  final void Function(ChatMember) onSelect;
+
+  const _MentionList({required this.members, required this.onSelect});
+
+  @override
+  Widget build(BuildContext context) {
+    if (members.isEmpty) return const SizedBox.shrink();
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 160),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+      ),
+      child: ListView.builder(
+        shrinkWrap: true,
+        itemCount: members.length,
+        itemBuilder: (ctx, i) => ListTile(
+          dense: true,
+          leading: CircleAvatar(
+            radius: 14,
+            backgroundColor: Colors.indigo.shade100,
+            child: Text(
+              members[i].initials,
+              style: TextStyle(fontSize: 11, color: Colors.indigo.shade700),
+            ),
+          ),
+          title: Text(members[i].displayName, style: const TextStyle(fontSize: 13)),
+          subtitle: Text('@${members[i].username}', style: const TextStyle(fontSize: 11)),
+          onTap: () => onSelect(members[i]),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Message Actions Bottom Sheet ──────────────────────────────────────────────
+
+class _MessageActionsSheet extends StatelessWidget {
+  final ChatMessage message;
+  final int myUserId;
+  final VoidCallback onReply;
+  final VoidCallback onCreateTask;
+  final VoidCallback onAssign;
+  final VoidCallback onRemind;
+  final VoidCallback? onDelete;
+
+  const _MessageActionsSheet({
+    required this.message,
+    required this.myUserId,
+    required this.onReply,
+    required this.onCreateTask,
+    required this.onAssign,
+    required this.onRemind,
+    this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey.shade300,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 12),
+          // Message preview
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              message.content,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+            ),
+          ),
+          const Divider(height: 20),
+          _ActionTile(
+            icon: Icons.reply,
+            color: Colors.grey.shade700,
+            label: 'Reply',
+            onTap: onReply,
+          ),
+          _ActionTile(
+            icon: Icons.task_alt,
+            color: Colors.indigo,
+            label: 'Convert to Task',
+            onTap: onCreateTask,
+          ),
+          _ActionTile(
+            icon: Icons.person_add_outlined,
+            color: Colors.teal,
+            label: 'Assign to...',
+            onTap: onAssign,
+          ),
+          _ActionTile(
+            icon: Icons.alarm_add_outlined,
+            color: Colors.amber.shade700,
+            label: 'Set Reminder',
+            onTap: onRemind,
+          ),
+          if (onDelete != null) ...[
+            const Divider(height: 8),
+            _ActionTile(
+              icon: Icons.delete_outline,
+              color: Colors.red,
+              label: 'Delete Message',
+              onTap: onDelete!,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ActionTile extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String label;
+  final VoidCallback onTap;
+
+  const _ActionTile({
+    required this.icon,
+    required this.color,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(icon, color: color),
+      title: Text(label, style: TextStyle(color: color)),
+      onTap: onTap,
+    );
+  }
+}
+
+// ── Create Task Sheet ─────────────────────────────────────────────────────────
+
+class _CreateTaskSheet extends StatefulWidget {
+  final ChatMessage message;
+  final List<ChatMember> members;
+  final Dio dio;
+  final VoidCallback onCreated;
+
+  const _CreateTaskSheet({
+    required this.message,
+    required this.members,
+    required this.dio,
+    required this.onCreated,
+  });
+
+  @override
+  State<_CreateTaskSheet> createState() => _CreateTaskSheetState();
+}
+
+class _CreateTaskSheetState extends State<_CreateTaskSheet> {
+  late TextEditingController _titleCtrl;
+  late TextEditingController _descCtrl;
+  String _priority = 'medium';
+  int? _assigneeId;
+  DateTime? _dueDate;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final preview = widget.message.content;
+    _titleCtrl = TextEditingController(
+      text: preview.length > 80 ? '${preview.substring(0, 80)}…' : preview,
+    );
+    _descCtrl = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _titleCtrl.dispose();
+    _descCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (_titleCtrl.text.trim().isEmpty) return;
+    setState(() => _saving = true);
+    try {
+      await widget.dio.post(ApiConstants.chatTasks, data: {
+        'title': _titleCtrl.text.trim(),
+        'description': _descCtrl.text.trim().isEmpty ? null : _descCtrl.text.trim(),
+        'sourceMessageId': widget.message.id,
+        'channelId': widget.message.channelId,
+        'priority': _priority,
+        if (_assigneeId != null) 'assignedToId': _assigneeId,
+        if (_dueDate != null) 'dueDate': DateFormat('yyyy-MM-dd').format(_dueDate!),
+      });
+      if (mounted) {
+        Navigator.pop(context);
+        widget.onCreated();
       }
-      final token = match.group(0)!;
-      spans.add(
-          TextSpan(text: token, style: token.startsWith('@') ? mentionStyle : tagStyle));
-      lastEnd = match.end;
+    } catch (_) {
+      if (mounted) setState(() => _saving = false);
     }
-    if (lastEnd < content.length) {
-      spans.add(TextSpan(text: content.substring(lastEnd), style: baseStyle));
-    }
+  }
 
-    return RichText(text: TextSpan(children: spans));
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 16, 16, MediaQuery.of(context).viewInsets.bottom + 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Convert to Task', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _titleCtrl,
+            decoration: const InputDecoration(labelText: 'Title', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _descCtrl,
+            decoration: const InputDecoration(labelText: 'Description (optional)', border: OutlineInputBorder()),
+            maxLines: 2,
+          ),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: _PriorityDropdown(value: _priority, onChanged: (v) => setState(() => _priority = v))),
+            const SizedBox(width: 12),
+            Expanded(child: _AssigneeDropdown(
+              members: widget.members,
+              value: _assigneeId,
+              onChanged: (v) => setState(() => _assigneeId = v),
+            )),
+          ]),
+          const SizedBox(height: 12),
+          _DueDatePicker(value: _dueDate, onChanged: (v) => setState(() => _dueDate = v)),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: _saving ? null : _save,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.indigo,
+                foregroundColor: Colors.white,
+              ),
+              child: _saving
+                  ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Text('Create Task'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Assign Message Sheet ──────────────────────────────────────────────────────
+
+class _AssignMessageSheet extends StatefulWidget {
+  final ChatMessage message;
+  final List<ChatMember> members;
+  final Dio dio;
+  final VoidCallback onAssigned;
+
+  const _AssignMessageSheet({
+    required this.message,
+    required this.members,
+    required this.dio,
+    required this.onAssigned,
+  });
+
+  @override
+  State<_AssignMessageSheet> createState() => _AssignMessageSheetState();
+}
+
+class _AssignMessageSheetState extends State<_AssignMessageSheet> {
+  int? _assigneeId;
+  final _noteCtrl = TextEditingController();
+  bool _saving = false;
+
+  @override
+  void dispose() { _noteCtrl.dispose(); super.dispose(); }
+
+  Future<void> _save() async {
+    if (_assigneeId == null) return;
+    setState(() => _saving = true);
+    try {
+      await widget.dio.post(ApiConstants.messageAssign(widget.message.id), data: {
+        'assignedToId': _assigneeId,
+        'note': _noteCtrl.text.trim().isEmpty ? null : _noteCtrl.text.trim(),
+      });
+      if (mounted) {
+        Navigator.pop(context);
+        widget.onAssigned();
+      }
+    } catch (_) {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 16, 16, MediaQuery.of(context).viewInsets.bottom + 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Assign Message', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(
+            widget.message.content,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 16),
+          _AssigneeDropdown(
+            members: widget.members,
+            value: _assigneeId,
+            onChanged: (v) => setState(() => _assigneeId = v),
+            label: 'Assign to',
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _noteCtrl,
+            decoration: const InputDecoration(labelText: 'Note (optional)', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: (_saving || _assigneeId == null) ? null : _save,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.teal,
+                foregroundColor: Colors.white,
+              ),
+              child: _saving
+                  ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Text('Assign'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Reminder Sheet ────────────────────────────────────────────────────────────
+
+class _ReminderSheet extends StatefulWidget {
+  final ChatMessage message;
+  final List<ChatMember> members;
+  final int myUserId;
+  final Dio dio;
+  final VoidCallback onSet;
+
+  const _ReminderSheet({
+    required this.message,
+    required this.members,
+    required this.myUserId,
+    required this.dio,
+    required this.onSet,
+  });
+
+  @override
+  State<_ReminderSheet> createState() => _ReminderSheetState();
+}
+
+class _ReminderSheetState extends State<_ReminderSheet> {
+  int? _remindUserId;
+  DateTime? _remindAt;
+  final _noteCtrl = TextEditingController();
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _remindUserId = widget.myUserId;
+  }
+
+  @override
+  void dispose() { _noteCtrl.dispose(); super.dispose(); }
+
+  void _setQuick(Duration offset) {
+    setState(() => _remindAt = DateTime.now().add(offset));
+  }
+
+  Future<void> _pickCustom() async {
+    final now = DateTime.now();
+    final date = await showDatePicker(
+      context: context,
+      initialDate: now.add(const Duration(days: 1)),
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 365)),
+    );
+    if (date == null || !mounted) return;
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(now),
+    );
+    if (time == null) return;
+    setState(() {
+      _remindAt = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    });
+  }
+
+  Future<void> _save() async {
+    if (_remindAt == null || _remindUserId == null) return;
+    setState(() => _saving = true);
+    try {
+      await widget.dio.post(ApiConstants.messageRemind(widget.message.id), data: {
+        'userId': _remindUserId,
+        'remindAt': _remindAt!.toUtc().toIso8601String(),
+        'note': _noteCtrl.text.trim().isEmpty ? null : _noteCtrl.text.trim(),
+      });
+      if (mounted) {
+        Navigator.pop(context);
+        widget.onSet();
+      }
+    } catch (_) {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 16, 16, MediaQuery.of(context).viewInsets.bottom + 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Set Reminder', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(
+            widget.message.content,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 16),
+          // Quick picks
+          Wrap(
+            spacing: 8,
+            children: [
+              _QuickChip(label: 'In 1 hour', onTap: () => _setQuick(const Duration(hours: 1))),
+              _QuickChip(label: 'Later today', onTap: () => _setQuick(const Duration(hours: 4))),
+              _QuickChip(label: 'Tomorrow 9am', onTap: () {
+                final tomorrow = DateTime.now().add(const Duration(days: 1));
+                setState(() => _remindAt = DateTime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0));
+              }),
+              _QuickChip(label: 'Next Monday', onTap: () {
+                final now = DateTime.now();
+                final daysUntilMonday = (8 - now.weekday) % 7;
+                final monday = now.add(Duration(days: daysUntilMonday == 0 ? 7 : daysUntilMonday));
+                setState(() => _remindAt = DateTime(monday.year, monday.month, monday.day, 9, 0));
+              }),
+              _QuickChip(label: 'Custom…', onTap: _pickCustom),
+            ],
+          ),
+          if (_remindAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              '⏰ ${DateFormat('EEE, MMM d • HH:mm').format(_remindAt!)}',
+              style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo),
+            ),
+          ],
+          const SizedBox(height: 12),
+          _AssigneeDropdown(
+            members: widget.members,
+            value: _remindUserId,
+            onChanged: (v) => setState(() => _remindUserId = v),
+            label: 'Remind who',
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _noteCtrl,
+            decoration: const InputDecoration(labelText: 'Note (optional)', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: (_saving || _remindAt == null) ? null : _save,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade700,
+                foregroundColor: Colors.white,
+              ),
+              child: _saving
+                  ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Text('Set Reminder'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _QuickChip extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _QuickChip({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return ActionChip(
+      label: Text(label, style: const TextStyle(fontSize: 12)),
+      onPressed: onTap,
+      backgroundColor: Colors.grey.shade100,
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+    );
+  }
+}
+
+// ── Shared widgets ─────────────────────────────────────────────────────────────
+
+class _PriorityDropdown extends StatelessWidget {
+  final String value;
+  final void Function(String) onChanged;
+
+  const _PriorityDropdown({required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButtonFormField<String>(
+      value: value,
+      decoration: const InputDecoration(labelText: 'Priority', border: OutlineInputBorder()),
+      items: const [
+        DropdownMenuItem(value: 'low', child: Text('Low')),
+        DropdownMenuItem(value: 'medium', child: Text('Medium')),
+        DropdownMenuItem(value: 'high', child: Text('High')),
+        DropdownMenuItem(value: 'urgent', child: Text('Urgent')),
+      ],
+      onChanged: (v) => v != null ? onChanged(v) : null,
+    );
+  }
+}
+
+class _AssigneeDropdown extends StatelessWidget {
+  final List<ChatMember> members;
+  final int? value;
+  final void Function(int?) onChanged;
+  final String label;
+
+  const _AssigneeDropdown({
+    required this.members,
+    required this.value,
+    required this.onChanged,
+    this.label = 'Assignee',
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButtonFormField<int>(
+      value: value,
+      decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+      items: members.map((m) => DropdownMenuItem(
+        value: m.id,
+        child: Text(m.displayName, overflow: TextOverflow.ellipsis),
+      )).toList(),
+      onChanged: onChanged,
+    );
+  }
+}
+
+class _DueDatePicker extends StatelessWidget {
+  final DateTime? value;
+  final void Function(DateTime?) onChanged;
+
+  const _DueDatePicker({this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: () async {
+        final picked = await showDatePicker(
+          context: context,
+          initialDate: value ?? DateTime.now().add(const Duration(days: 1)),
+          firstDate: DateTime.now(),
+          lastDate: DateTime.now().add(const Duration(days: 365)),
+        );
+        onChanged(picked);
+      },
+      child: InputDecorator(
+        decoration: const InputDecoration(labelText: 'Due date (optional)', border: OutlineInputBorder()),
+        child: Text(
+          value != null ? DateFormat('yyyy-MM-dd').format(value!) : 'No due date',
+          style: TextStyle(color: value != null ? Colors.black : Colors.grey.shade500),
+        ),
+      ),
+    );
   }
 }

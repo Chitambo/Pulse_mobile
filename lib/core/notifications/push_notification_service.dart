@@ -2,12 +2,8 @@ import 'dart:convert';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
-// Top-level background handler — must be a bare function, not a class method.
 @pragma('vm:entry-point')
-Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
-  // The FCM plugin shows a system notification automatically in background/terminated.
-  // Nothing extra needed here unless you want custom handling.
-}
+Future<void> firebaseBackgroundHandler(RemoteMessage message) async {}
 
 class PushNotificationService {
   static final _instance = PushNotificationService._internal();
@@ -16,13 +12,16 @@ class PushNotificationService {
 
   final _plugin = FlutterLocalNotificationsPlugin();
 
-  // Set this from app.dart after authentication to handle navigation on tap.
   void Function(Map<String, dynamic> data)? onNotificationTap;
+  void Function(String token)? onTokenRefresh;
 
+  // Standard channel
   static const _channelId = 'pulse_notifications';
   static const _channelName = 'Pulse';
 
-  // ── Init ──────────────────────────────────────────────────────────────────
+  // Urgent channel — max importance, full-screen intent on Android
+  static const _urgentChannelId = 'pulse_urgent';
+  static const _urgentChannelName = 'Pulse Urgent Alerts';
 
   Future<void> init() async {
     await _initLocal();
@@ -36,56 +35,56 @@ class PushNotificationService {
       onDidReceiveNotificationResponse: _onLocalTap,
     );
 
-    // Create the high-importance channel required for Android 8+
-    const channel = AndroidNotificationChannel(
+    final androidImpl = _plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
+    // Standard channel
+    await androidImpl?.createNotificationChannel(const AndroidNotificationChannel(
       _channelId,
       _channelName,
       description: 'Pulse app alerts',
       importance: Importance.high,
       enableVibration: true,
       playSound: true,
-    );
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
+    ));
 
-    // Request POST_NOTIFICATIONS permission (Android 13+)
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.requestNotificationsPermission();
+    // Urgent channel — highest importance, vibration pattern, sound
+    await androidImpl?.createNotificationChannel(AndroidNotificationChannel(
+      _urgentChannelId,
+      _urgentChannelName,
+      description: 'Critical alerts that require immediate attention',
+      importance: Importance.max,
+      enableVibration: true,
+      playSound: true,
+      enableLights: true,
+      ledColor: const Color.fromARGB(255, 220, 38, 38),
+    ));
+
+    await androidImpl?.requestNotificationsPermission();
   }
 
   Future<void> _initFcm() async {
     try {
       final messaging = FirebaseMessaging.instance;
-
-      // Request permission (harmless if Firebase isn't configured)
       await messaging.requestPermission(alert: true, badge: true, sound: true);
-
-      // Override FCM foreground presentation — we show our own local notification
       await messaging.setForegroundNotificationPresentationOptions(
-        alert: false,
-        badge: true,
-        sound: false,
+        alert: false, badge: true, sound: false,
       );
 
-      // Foreground: FCM delivers silently — we show a local notification
       FirebaseMessaging.onMessage.listen((msg) {
+        final isUrgent = msg.data['type'] == 'urgent_message';
         showLocal(
           title: msg.notification?.title ?? 'Pulse',
           body: msg.notification?.body ?? '',
           data: msg.data,
+          urgent: isUrgent,
         );
       });
 
-      // Tap while app was in background
       FirebaseMessaging.onMessageOpenedApp.listen((msg) {
         onNotificationTap?.call(msg.data);
       });
 
-      // Tap from terminated state
       final initial = await messaging.getInitialMessage();
       if (initial != null) {
         Future.delayed(const Duration(milliseconds: 500), () {
@@ -93,56 +92,45 @@ class PushNotificationService {
         });
       }
 
-      // Keep token fresh
       messaging.onTokenRefresh.listen(_onTokenRefresh);
-    } catch (_) {
-      // Firebase not yet configured — local notifications still work.
-    }
+    } catch (_) {}
   }
-
-  // ── Token ─────────────────────────────────────────────────────────────────
 
   Future<String?> getToken() async {
-    try {
-      return await FirebaseMessaging.instance.getToken();
-    } catch (_) {
-      return null;
-    }
+    try { return await FirebaseMessaging.instance.getToken(); } catch (_) { return null; }
   }
 
-  void _onTokenRefresh(String token) {
-    // Forwarded to AuthProvider via the onTokenRefresh callback if set.
-    onTokenRefresh?.call(token);
-  }
-
-  void Function(String token)? onTokenRefresh;
-
-  // ── Show a local notification ─────────────────────────────────────────────
+  void _onTokenRefresh(String token) => onTokenRefresh?.call(token);
 
   Future<void> showLocal({
     required String title,
     required String body,
     Map<String, dynamic> data = const {},
+    bool urgent = false,
     int? id,
   }) async {
+    final channelId = urgent ? _urgentChannelId : _channelId;
+    final channelName = urgent ? _urgentChannelName : _channelName;
+
     await _plugin.show(
       id ?? (DateTime.now().millisecondsSinceEpoch & 0x7FFFFFFF),
-      title,
+      urgent ? '🚨 $title' : title,
       body,
       NotificationDetails(
         android: AndroidNotificationDetails(
-          _channelId,
-          _channelName,
-          importance: Importance.high,
-          priority: Priority.high,
+          channelId,
+          channelName,
+          importance: urgent ? Importance.max : Importance.high,
+          priority: urgent ? Priority.max : Priority.high,
           icon: '@mipmap/ic_launcher',
+          color: urgent ? const Color.fromARGB(255, 220, 38, 38) : null,
+          enableVibration: true,
+          fullScreenIntent: urgent,
         ),
       ),
       payload: data.isEmpty ? null : jsonEncode(data),
     );
   }
-
-  // ── Tap handler ───────────────────────────────────────────────────────────
 
   void _onLocalTap(NotificationResponse response) {
     final payload = response.payload;

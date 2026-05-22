@@ -37,26 +37,29 @@ class SocketService {
     _socket?.emit('leave_channel', {'channelId': channelId});
   }
 
+  /// Send a message. Set [urgencyLevel] to 'urgent' for priority alerts.
   void sendMessage({
     required int channelId,
     required String content,
     String type = 'text',
     int? parentId,
+    String urgencyLevel = 'normal',
   }) {
     _socket?.emit('send_message', {
       'channelId': channelId,
       'content': content,
       'type': type,
+      'urgencyLevel': urgencyLevel,
       if (parentId != null) 'parentId': parentId,
     });
   }
 
   void emitTyping(int channelId) {
-    _socket?.emit('typing', {'channelId': channelId});
+    _socket?.emit('typing_start', {'channelId': channelId});
   }
 
   void emitStopTyping(int channelId) {
-    _socket?.emit('stop_typing', {'channelId': channelId});
+    _socket?.emit('typing_stop', {'channelId': channelId});
   }
 
   void markRead(int channelId) {

@@ -1,8 +1,8 @@
 class ApiConstants {
-  static const String baseUrl = 'https://stage1.tklapp.com/api';
-  static const String socketUrl = 'https://stage1.tklapp.com';
+  static const String baseUrl = 'http://52.42.96.17/api';
+  static const String socketUrl = 'http://52.42.96.17';
   static const String socketPath = '/socket.io';
-  static const String uploadsUrl = 'https://stage1.tklapp.com/uploads';
+  static const String uploadsUrl = 'http://52.42.96.17/uploads';
 
   // Auth
   static const String login = '/auth/login';
@@ -37,11 +37,29 @@ class ApiConstants {
   static const String dashboardDeveloper = '/dashboard/developer';
   static const String dashboardMy = '/dashboard/my';
 
-  // Chat
+  // Chat — channels & messages
   static const String chatChannels = '/chat/channels';
   static const String chatDm = '/chat/dm';
   static const String chatUsers = '/chat/users';
   static const String chatSearch = '/chat/search';
+
+  // Chat — tasks
+  static const String chatTasks = '/chat/tasks';
+
+  // Chat — notification preferences
+  static const String chatNotificationPreferences = '/chat/notification-preferences';
+
+  // Chat — reminders
+  static const String chatReminders = '/chat/reminders';
+
+  // Dynamic helpers
+  static String channelMessages(int channelId) => '/chat/channels/$channelId/messages';
+  static String channelRead(int channelId) => '/chat/channels/$channelId/read';
+  static String channelUpload(int channelId) => '/chat/channels/$channelId/upload';
+  static String channelNotificationLevel(int channelId) => '/chat/channels/$channelId/notification-level';
+  static String messageAssign(int messageId) => '/chat/messages/$messageId/assign';
+  static String messageRemind(int messageId) => '/chat/messages/$messageId/remind';
+  static String taskById(int taskId) => '/chat/tasks/$taskId';
 
   // Settings
   static const String settings = '/settings';
@@ -52,7 +70,7 @@ class ApiConstants {
   // Expenses
   static const String expenses = '/expenses';
 
-  // Bookkeeping (CEO/admin/accounts only)
+  // Bookkeeping
   static const String bookkeepingSummary = '/bookkeeping/summary';
   static const String bookkeepingMonthly = '/bookkeeping/monthly';
   static const String bookkeepingExpenseBreakdown = '/bookkeeping/expense-breakdown';
