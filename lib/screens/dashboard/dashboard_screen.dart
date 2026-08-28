@@ -187,10 +187,10 @@ class _MyDashboard extends StatelessWidget {
           Row(
             children: [
               Expanded(child: _KpiCard(
-                'Today\'s Activities',
-                '${data['todayReported'] ?? 0}',
+                'Daily Report',
+                data['todayReported'] == true ? 'Submitted' : 'Not yet',
                 Icons.today,
-                Colors.blue,
+                data['todayReported'] == true ? Colors.green : Colors.red,
                 onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DailyActivitiesScreen())),
               )),
               const SizedBox(width: 8),
