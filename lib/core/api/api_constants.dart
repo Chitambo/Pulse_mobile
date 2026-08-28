@@ -4,7 +4,7 @@ class ApiConstants {
   //   flutter build apk  --dart-define=API_ORIGIN=https://<staging-host>
   // Default is production.
   static const String origin =
-      String.fromEnvironment('API_ORIGIN', defaultValue: 'https://pulse.wc-computer.com');
+      String.fromEnvironment('API_ORIGIN', defaultValue: 'https://pulse.52.42.96.17.nip.io');
 
   static const String baseUrl = '$origin/api';
   static const String socketUrl = origin;

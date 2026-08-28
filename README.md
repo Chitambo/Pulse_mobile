@@ -20,7 +20,7 @@ flutter run --dart-define=API_ORIGIN=http://10.0.2.2:5000        # Android emula
 flutter run --dart-define=API_ORIGIN=http://192.168.1.20:5000    # physical device on LAN
 ```
 
-Default (no flag): `https://pulse.wc-computer.com` (production).
+Default (no flag): `https://pulse.52.42.96.17.nip.io` (production).
 
 > `network_security_config.xml` permits cleartext **only** to `10.0.2.2` / `localhost`
 > for local dev. Everything else must be HTTPS.
