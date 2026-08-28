@@ -11,6 +11,24 @@ import '../../widgets/common_widgets.dart';
 
 final _zmw = NumberFormat.currency(locale: 'en_ZM', symbol: 'ZMW ', decimalDigits: 2);
 
+/// Parse "1,250.50" / "ZMW 1250" / " 200 " -> 1250.5 / 1250 / 200
+double _parseMoney(String s) => double.tryParse(s.replaceAll(RegExp(r'[^0-9.\-]'), '')) ?? 0;
+
+/// Human-readable message for a Dio failure (network vs server).
+String _dioMessage(DioException e) {
+  switch (e.type) {
+    case DioExceptionType.connectionTimeout:
+    case DioExceptionType.receiveTimeout:
+    case DioExceptionType.sendTimeout:
+      return 'The server did not respond. Check your connection.';
+    case DioExceptionType.connectionError:
+      return 'Can’t reach the server (${ApiConstants.origin}).';
+    default:
+      return (e.response?.data is Map ? e.response?.data['message'] : null)?.toString()
+          ?? 'Request failed (${e.response?.statusCode ?? 'no response'})';
+  }
+}
+
 Color _statusColor(String s) => {
       'paid': Colors.green,
       'approved': Colors.teal,
@@ -216,7 +234,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     } on DioException catch (err) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(err.response?.data?['message'] ?? 'Failed')));
+            .showSnackBar(SnackBar(content: Text(_dioMessage(err)), backgroundColor: Colors.red));
       }
     }
   }
@@ -259,8 +277,8 @@ class _NewExpenseScreenState extends State<_NewExpenseScreen> {
         'date': _dateCtrl.text,
         'category': _category,
         'payee': _payeeCtrl.text.trim(),
-        'amount': double.tryParse(_amountCtrl.text) ?? 0,
-        'vatAmount': double.tryParse(_vatCtrl.text) ?? 0,
+        'amount': _parseMoney(_amountCtrl.text),
+        'vatAmount': _parseMoney(_vatCtrl.text),
         'paymentMethod': _method,
         if (_descCtrl.text.isNotEmpty) 'description': _descCtrl.text.trim(),
       });
@@ -275,7 +293,12 @@ class _NewExpenseScreenState extends State<_NewExpenseScreen> {
     } on DioException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.response?.data?['message'] ?? 'Error')));
+            .showSnackBar(SnackBar(content: Text(_dioMessage(e)), backgroundColor: Colors.red));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Unexpected error: $e'), backgroundColor: Colors.red));
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -313,7 +336,10 @@ class _NewExpenseScreenState extends State<_NewExpenseScreen> {
                     controller: _amountCtrl,
                     decoration: const InputDecoration(labelText: 'Amount (ZMW) *'),
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    validator: (v) => v!.isEmpty ? 'Required' : null,
+                    validator: (v) {
+                      if (v == null || v.trim().isEmpty) return 'Required';
+                      return _parseMoney(v) > 0 ? null : 'Enter a valid amount';
+                    },
                   ),
                 ),
                 const SizedBox(width: 12),
