@@ -39,9 +39,12 @@ class ApiClient {
 
   Future<void> _onError(DioException err, ErrorInterceptorHandler handler) async {
     final statusCode = err.response?.statusCode;
-    final message = (err.response?.data?['message'] ?? '').toString().toLowerCase();
 
-    if (statusCode != 401 || !message.contains('expired')) {
+    // Any 401 (except on the auth endpoints themselves) means the access token
+    // can't be used any more — attempt one refresh and retry, regardless of the
+    // exact server message.
+    final isAuthCall = err.requestOptions.path.contains('/auth/');
+    if (statusCode != 401 || isAuthCall) {
       handler.next(err);
       return;
     }

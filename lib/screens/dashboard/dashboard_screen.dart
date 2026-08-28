@@ -13,6 +13,9 @@ import '../invoices/invoices_screen.dart';
 import '../sales_leads/sales_leads_screen.dart';
 import '../daily_activities/daily_activities_screen.dart';
 import '../weekly_summaries/weekly_summaries_screen.dart';
+import '../approvals/approvals_screen.dart';
+import '../expenses/expenses_screen.dart';
+import '../quotations/quotations_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -102,6 +105,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Approvals',
+            icon: const Icon(Icons.fact_check_outlined),
+            onPressed: () => Navigator.push(
+                context, MaterialPageRoute(builder: (_) => const ApprovalsScreen())),
+          ),
           IconButton(icon: const Icon(Icons.refresh), onPressed: _load),
         ],
       ),
@@ -115,6 +124,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     padding: const EdgeInsets.all(16),
                     children: [
                       if (_myData != null) _MyDashboard(data: _myData!),
+                      const SizedBox(height: 8),
+                      _QuickLinks(user: user),
                       if (_roleData != null) ...[
                         const SizedBox(height: 16),
                         if (user.isAdmin || user.isCeo) _CeoDashboard(data: _roleData!),
@@ -125,6 +136,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ),
     );
+  }
+}
+
+// ─── Quick links ──────────────────────────────────────────────────────────────
+
+class _QuickLinks extends StatelessWidget {
+  final dynamic user;
+  const _QuickLinks({required this.user});
+
+  @override
+  Widget build(BuildContext context) {
+    final finance = user.isAdmin || user.isAccounts;
+    void go(Widget s) => Navigator.push(context, MaterialPageRoute(builder: (_) => s));
+
+    final chips = <Widget>[
+      ActionChip(
+        avatar: const Icon(Icons.fact_check_outlined, size: 18),
+        label: const Text('Approvals'),
+        onPressed: () => go(const ApprovalsScreen()),
+      ),
+      ActionChip(
+        avatar: const Icon(Icons.receipt_long_outlined, size: 18),
+        label: const Text('Expenses'),
+        onPressed: () => go(const ExpensesScreen()),
+      ),
+      if (finance)
+        ActionChip(
+          avatar: const Icon(Icons.request_quote_outlined, size: 18),
+          label: const Text('Quotations'),
+          onPressed: () => go(const QuotationsScreen()),
+        ),
+    ];
+
+    return Wrap(spacing: 8, runSpacing: 8, children: chips);
   }
 }
 

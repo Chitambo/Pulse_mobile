@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:timeago/timeago.dart' as timeago;
+import '../../core/notifications/notification_router.dart';
 import '../../providers/notification_provider.dart';
 import '../../widgets/common_widgets.dart';
 
@@ -104,8 +105,17 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                             ],
                           ),
                           isThreeLine: true,
+                          trailing: n.entityType != null
+                              ? const Icon(Icons.chevron_right, color: Colors.grey)
+                              : null,
                           onTap: () {
                             if (!n.isRead) provider.markRead(n.id);
+                            if (n.entityType != null) {
+                              openFromNotification({
+                                'entityType': n.entityType,
+                                'entityId': n.entityId,
+                              });
+                            }
                           },
                         ),
                       );
@@ -121,6 +131,9 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       case 'task': return Icons.task;
       case 'invoice': return Icons.receipt;
       case 'lead': return Icons.trending_up;
+      case 'approval_pending': return Icons.how_to_reg;
+      case 'approval_result': return Icons.fact_check;
+      case 'scheduled_payment_due': return Icons.event_repeat;
       default: return Icons.notifications;
     }
   }

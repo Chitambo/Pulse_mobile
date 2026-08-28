@@ -1,8 +1,15 @@
 class ApiConstants {
-  static const String baseUrl = 'http://52.42.96.17/api';
-  static const String socketUrl = 'http://52.42.96.17';
+  // Server origin. Override at build/run time without touching code:
+  //   flutter run        --dart-define=API_ORIGIN=https://pulse.example.com
+  //   flutter build apk  --dart-define=API_ORIGIN=https://pulse.example.com
+  // Falls back to the current production box when nothing is passed.
+  static const String origin =
+      String.fromEnvironment('API_ORIGIN', defaultValue: 'http://52.42.96.17');
+
+  static const String baseUrl = '$origin/api';
+  static const String socketUrl = origin;
   static const String socketPath = '/socket.io';
-  static const String uploadsUrl = 'http://52.42.96.17/uploads';
+  static const String uploadsUrl = '$origin/uploads';
 
   // Auth
   static const String login = '/auth/login';
@@ -75,4 +82,13 @@ class ApiConstants {
   static const String bookkeepingMonthly = '/bookkeeping/monthly';
   static const String bookkeepingExpenseBreakdown = '/bookkeeping/expense-breakdown';
   static const String bookkeepingTransactions = '/bookkeeping/transactions';
+
+  // Approvals
+  static const String approvals = '/approvals';        // my inbox
+  static const String approvalsMine = '/approvals/mine';
+  static String approvalAct(int id) => '/approvals/$id/act';
+
+  // Notifications
+  static String notificationRead(int id) => '/notifications/$id/read';
+  static const String notificationsReadAll = '/notifications/read-all';
 }

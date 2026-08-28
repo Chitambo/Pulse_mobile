@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">stage1.tklapp.com</domain>
+    <!-- Default: HTTPS only, trust the system CA store. -->
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
-            <certificates src="system"/>
-            <certificates src="user"/>
+            <certificates src="system" />
         </trust-anchors>
+    </base-config>
+
+    <!-- TEMPORARY: the Pulse API box is still plain HTTP.
+         Delete this block once the server is on HTTPS and
+         API_ORIGIN points at an https:// URL. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">52.42.96.17</domain>
     </domain-config>
 </network-security-config>

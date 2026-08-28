@@ -1,0 +1,10 @@
+# Copy to android/key.properties and fill in for release signing.
+# Generate a keystore:
+#   keytool -genkey -v -keystore ~/pulse-release.jks -keyalg RSA -keysize 2048 \
+#           -validity 10000 -alias pulse
+# Do NOT commit key.properties or the .jks file.
+
+storePassword=changeit
+keyPassword=changeit
+keyAlias=pulse
+storeFile=/absolute/path/to/pulse-release.jks

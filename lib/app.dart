@@ -1,12 +1,14 @@
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'core/api/api_client.dart';
-import 'core/api/api_constants.dart';
 import 'core/auth/token_storage.dart';
+import 'core/notifications/notification_router.dart';
 import 'core/notifications/push_notification_service.dart';
 import 'core/socket/socket_service.dart';
 import 'core/theme/app_theme.dart';
+import 'main.dart' show firebaseReady;
 import 'models/chat.dart';
 import 'providers/auth_provider.dart';
 import 'providers/notification_provider.dart';
@@ -33,6 +35,7 @@ class PulseApp extends StatelessWidget {
         title: 'Pulse',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.theme,
+        navigatorKey: appNavigatorKey,
         home: const _AuthGate(),
       ),
     );
@@ -49,6 +52,33 @@ class _AuthGate extends StatefulWidget {
 class _AuthGateState extends State<_AuthGate> {
   bool _sessionStarted = false;
 
+  Future<void> _startSession(BuildContext context) async {
+    // Capture providers up front — no BuildContext use after the awaits below.
+    final np = context.read<NotificationProvider>();
+    final auth = context.read<AuthProvider>();
+
+    final token = await TokenStorage.getToken();
+    if (token != null) SocketService().connect(token);
+
+    np.load(refresh: true);
+    np.loadChatUnread();
+
+    // Live badge refresh when the server pushes a notification over the socket.
+    SocketService().on('notification', (_) => np.load(refresh: true));
+
+    // Route taps on push / local notifications to the right screen.
+    PushNotificationService().onNotificationTap = openFromNotification;
+
+    // Register the device's FCM token with the backend (correct payload shape).
+    if (firebaseReady) {
+      final platform = Platform.isIOS ? 'ios' : 'android';
+      PushNotificationService().onTokenRefresh =
+          (fcmToken) => auth.registerFcmToken(fcmToken, platform);
+      final current = await PushNotificationService().getToken();
+      if (current != null) auth.registerFcmToken(current, platform);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<AuthProvider>(
@@ -62,6 +92,7 @@ class _AuthGateState extends State<_AuthGate> {
           case AuthStatus.unauthenticated:
             if (_sessionStarted) {
               _sessionStarted = false;
+              SocketService().off('notification');
               SocketService().disconnect();
             }
             return const LoginScreen();
@@ -71,20 +102,7 @@ class _AuthGateState extends State<_AuthGate> {
 
             if (!_sessionStarted) {
               _sessionStarted = true;
-              // Wire up socket and notifications after first authenticated frame.
-              WidgetsBinding.instance.addPostFrameCallback((_) async {
-                final token = await _readToken();
-                if (token != null) SocketService().connect(token);
-
-                final np = context.read<NotificationProvider>();
-                np.load(refresh: true);
-                np.loadChatUnread();
-
-                PushNotificationService().onTokenRefresh = (fcmToken) {
-                  ApiClient().dio.post(ApiConstants.deviceToken,
-                      data: {'token': fcmToken}).catchError((_) => null);
-                };
-              });
+              WidgetsBinding.instance.addPostFrameCallback((_) => _startSession(context));
             }
 
             if (user.mustChangePassword) {
@@ -96,8 +114,6 @@ class _AuthGateState extends State<_AuthGate> {
       },
     );
   }
-
-  Future<String?> _readToken() => TokenStorage.getToken();
 }
 
 // ── Main shell ────────────────────────────────────────────────────────────────
@@ -137,10 +153,10 @@ class _MainShellState extends State<_MainShell> {
                   myUserId: widget.userId,
                   onChannelTap: (ch) => setState(() => _activeChannel = ch),
                 )
-              : WillPopScope(
-                  onWillPop: () async {
-                    setState(() => _activeChannel = null);
-                    return false;
+              : PopScope(
+                  canPop: false,
+                  onPopInvokedWithResult: (didPop, _) {
+                    if (!didPop) setState(() => _activeChannel = null);
                   },
                   child: ChatScreen(
                     channel: _activeChannel!,
@@ -151,7 +167,7 @@ class _MainShellState extends State<_MainShell> {
                   ),
                 ),
 
-          // 2 — Tasks (new)
+          // 2 — Tasks
           TasksScreen(dio: dio, myUserId: widget.userId),
 
           // 3 — Notifications

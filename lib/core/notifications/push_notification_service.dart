@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart' show Color;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -94,11 +95,22 @@ class PushNotificationService {
       }
 
       messaging.onTokenRefresh.listen(_onTokenRefresh);
-    } catch (_) {}
+
+      // Hand the current token straight to the app so it can register it.
+      final current = await messaging.getToken();
+      if (current != null) onTokenRefresh?.call(current);
+    } catch (e) {
+      debugPrint('FCM init failed: $e');
+    }
   }
 
   Future<String?> getToken() async {
-    try { return await FirebaseMessaging.instance.getToken(); } catch (_) { return null; }
+    try {
+      return await FirebaseMessaging.instance.getToken();
+    } catch (e) {
+      debugPrint('FCM getToken failed: $e');
+      return null;
+    }
   }
 
   void _onTokenRefresh(String token) => onTokenRefresh?.call(token);
