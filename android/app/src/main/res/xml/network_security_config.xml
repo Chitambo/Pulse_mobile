@@ -1,20 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Default: HTTPS only, trust the system CA store. -->
+    <!-- Production is HTTPS only. Trust the system CA store. -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
 
-    <!-- TEMPORARY: the Pulse API box is still plain HTTP.
-         Delete this block once the server is on HTTPS and
-         API_ORIGIN points at an https:// URL. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">52.42.96.17</domain>
-    </domain-config>
-
-    <!-- Local development: Android emulator -> host loopback, and adb reverse. -->
+    <!-- Local development only: Android emulator -> host loopback, and adb reverse. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">10.0.2.2</domain>
         <domain includeSubdomains="false">localhost</domain>

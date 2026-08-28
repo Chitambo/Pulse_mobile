@@ -1,10 +1,10 @@
 class ApiConstants {
   // Server origin. Override at build/run time without touching code:
-  //   flutter run        --dart-define=API_ORIGIN=https://pulse.example.com
-  //   flutter build apk  --dart-define=API_ORIGIN=https://pulse.example.com
-  // Falls back to the current production box when nothing is passed.
+  //   flutter run        --dart-define=API_ORIGIN=http://10.0.2.2:5000
+  //   flutter build apk  --dart-define=API_ORIGIN=https://<staging-host>
+  // Default is production.
   static const String origin =
-      String.fromEnvironment('API_ORIGIN', defaultValue: 'http://52.42.96.17');
+      String.fromEnvironment('API_ORIGIN', defaultValue: 'https://pulse.wc-computer.com');
 
   static const String baseUrl = '$origin/api';
   static const String socketUrl = origin;

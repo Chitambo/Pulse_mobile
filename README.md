@@ -18,16 +18,12 @@ without touching code:
 # local backend
 flutter run --dart-define=API_ORIGIN=http://10.0.2.2:5000        # Android emulator -> host
 flutter run --dart-define=API_ORIGIN=http://192.168.1.20:5000    # physical device on LAN
-
-# staging / prod
-flutter build apk --release --dart-define=API_ORIGIN=https://pulse.example.com
 ```
 
-Default (no flag): `http://52.42.96.17`.
+Default (no flag): `https://pulse.wc-computer.com` (production).
 
-> The production box is still plain **HTTP**. `android/app/src/main/res/xml/network_security_config.xml`
-> whitelists `52.42.96.17` for cleartext as a stopgap — delete that block once the
-> server is on HTTPS and `API_ORIGIN` is an `https://` URL.
+> `network_security_config.xml` permits cleartext **only** to `10.0.2.2` / `localhost`
+> for local dev. Everything else must be HTTPS.
 
 ## Run
 
